@@ -9,6 +9,8 @@ import io
 from struct import *
 import xml.etree.ElementTree as ET
 
+from scipy.interpolate import PchipInterpolator
+
 
 #Decarator has been copied from the https://github.com/symartin/PyMDT
 
@@ -90,7 +92,6 @@ class MDTReader(Reader):
         images or curves.
 
     """
-
     def __init__(self, file_path, *args, **kwargs):
         super().__init__(file_path, *args, **kwargs)
 
@@ -113,6 +114,7 @@ class MDTReader(Reader):
             print(f'Number of frames: {self.nb_frame}')
             print()
         dataset_dict = {}
+        dataset_list = []
         #channel_number = 0
         #iterator for the frames inside the file
         for i in range(self.nb_frame):
@@ -130,21 +132,21 @@ class MDTReader(Reader):
                 self._frame._read_text()#TODO
 
 
-            #dataset_list.append(self._frame.data)
-            key_channel = f"Channel_{i:03d}"
-            dataset_dict[key_channel] = self._frame.data
+            dataset_list.append(self._frame.data)
+            # key_channel = f"Channel_{i:03d}"
+            # dataset_dict[key_channel] = self._frame.data
 
             #might be rewrite to create dict() initially - without list()
-            # dataset_dict = {}
-            # for index, dataset in enumerate(dataset_list):
-            #     if type(dataset) == sidpy.Dataset:
-            #         title = dataset.title
-            #     elif type(dataset) == dict:
-            #         title = 'Spectral_data'
-            #     else:
-            #         title = 'Unknown'
-            #
-            #     dataset_dict[f'{index:03}_{title}'] = dataset
+            dataset_dict = {}
+            for index, dataset in enumerate(dataset_list):
+                if type(dataset) == sidpy.Dataset:
+                    title = dataset.title
+                elif type(dataset) == dict:
+                    title = 'Point_Cloud'
+                else:
+                    title = 'Unknown'
+
+                dataset_dict[f'{index:03}_{title}'] = dataset
 
             if verbose:
                 print(f'Frame #{i}: type - {self._frame.type}',
@@ -169,18 +171,173 @@ class MDTReader(Reader):
         '''
         # magic header
         self._file.shift_position(4)
-
         # File frm_byte_size (w/o header)
         self._file_size = self._file.read_uint32()
-
         #  4 bytes reserved (??)
         self._file.shift_position(4)
-
         # last frame
         self.nb_frame = self._file.read_uint16() + 1 #it originally returns number of frame -1, due to numeration from zero
-
         #  19 bytes reserved (??)
         self._file.shift_position(19)
+
+    def to_point_cloud(self, spectrum_dict):
+        """Convert a dictionary of spectra into a point cloud.
+
+        If the number of points differs between spectra, interpolate them
+        to a common size before conversion.
+        """
+        if not isinstance(spectrum_dict, dict):
+            raise TypeError("The input data must be a dictionary.")
+
+        _keys = list(spectrum_dict.keys())
+        _values = list(spectrum_dict.values())
+
+        #check that all datasets are spectra
+        invalid = [k for k in _keys if spectrum_dict[k].data_type != sid.DataType.SPECTRUM]
+        if invalid:
+            raise TypeError(f"Non-SPECTRUM datasets found: {invalid}")
+
+        #check units and channels
+        self._check_metadata_consistency(spectrum_dict, _keys)
+
+        #check number of channel
+        ref_ch_number = spectrum_dict[_keys[0]].shape[1]
+        mismatched = [
+            k for k, ds in spectrum_dict.items()
+            if ds.shape[1] != ref_ch_number
+        ]
+        if mismatched:
+            raise ValueError(
+                f"Datasets {mismatched} have inconsistent number of channels"
+                f"(expected {ref_ch_number})."
+            )
+        #----------------------------------
+        #spectrums to array
+
+        # Find the dataset with the shortest x-axis
+        lengths = np.fromiter((len(d.x) for d in _values), dtype=int)
+        main_x = _values[lengths.argmin()].x
+
+        # Collect aligned datasets
+        _points_data_y = []
+        for sp_point in _values:
+            if np.array_equal(sp_point.x, main_x):
+                # Already aligned → use directly
+                _points_data_y.append(sp_point.compute().T)
+            else:
+                # Align by fitting and interpolating
+                aligned = [
+                    self._interpolate_branchwise(main_x, self._fit_branches(sp_point.x, spect))
+                    for spect in sp_point.T
+                ]
+                _points_data_y.append(np.column_stack(aligned).T)
+
+        #points coordinates
+        _coordinates = np.array([d.metadata["coordinate"] for d in _values], dtype=float)
+
+        #to np.array
+        _points_data_y = np.array(_points_data_y)
+
+        #build point cloud
+        _metadata = _values[0].metadata.copy()
+        _units = _metadata['units']
+        _ar_channels = _metadata['channels']
+        _u = _units[0] if len(_units) == 1 else 'a.u.'
+        _q = _ar_channels[0] if len(_ar_channels) == 1 else 'signal'
+
+        point_cloud_dset = sidpy.Dataset.from_array(_points_data_y,
+                                                    datatype='point_cloud',  # specify point_cloud datatype
+                                                    coordinates=_coordinates,  # necessery
+                                                    units=_u,
+                                                    quantity=_q,
+                                                    )
+
+        point_cloud_dset.set_dimension(0, sidpy.Dimension(np.arange(_points_data_y.shape[0]),
+                                              name='point number',
+                                              quantity='Point number',
+                                              dimension_type='point_cloud'))
+
+        if len(_points_data_y.shape) > 2:
+            point_cloud_dset.set_dimension(1, _values[lengths.argmin()].channel)
+            point_cloud_dset.set_dimension(2, main_x)
+        else:
+            point_cloud_dset.set_dimension(1, main_x)
+
+        point_cloud_dset.metadata = _metadata
+        point_cloud_dset.metadata.pop('coordinate', None)
+        point_cloud_dset.original_metadata = _values[0].original_metadata
+
+        return point_cloud_dset
+
+    @staticmethod
+    def _check_metadata_consistency(spectrum_dict, keys, fields=('units', 'channels')):
+        """Check metadata consistency for the .to_point_cloud method"""
+        ref_key = keys[0]
+        ref_meta = spectrum_dict[ref_key].metadata
+
+        for field in fields:
+            mismatched = [
+                k for k in keys
+                if spectrum_dict[k].metadata.get(field) != ref_meta.get(field)
+            ]
+            if mismatched:
+                raise ValueError(
+                    f"Mismatch in '{field}': datasets {mismatched} differ "
+                    f"from reference dataset '{ref_key}' "
+                    f"({ref_meta.get(field)!r}).")
+
+        spans = np.array([(np.max(d.x.values) - np.min(d.x.values)) for d in spectrum_dict.values()])
+        minimums = np.array([np.min(d.x.values) for d in spectrum_dict.values()])
+
+        # Define threshold as 10% of mean span
+        threshold = 0.1 * spans.mean()
+        #print(f"Spans: {spans}, Minimums: {minimums}, Threshold: {threshold} ")
+        # Check consistency of the x axes
+        if (spans.max() - spans.min() >= threshold) or (minimums.max() - minimums.min() >= threshold):
+            raise ValueError(f"⚠️ Significant difference between the x axes is detected. "
+                             f"Spans: {spans}, Minimums: {minimums}, Threshold: {threshold} ")
+
+        #below is 3 service functions for self.to_point_cloud() method
+    @staticmethod
+    def _split_branches(x):
+        """Return inclusive [start, end] indices of monotonic branches."""
+        x = np.asarray(x)
+        s = np.sign(np.diff(x))
+        for i in range(1, s.size):
+            if s[i] == 0: s[i] = s[i - 1]
+        if s.size and s[0] == 0: s[0] = 1
+        s[s == 0] = 1
+        cuts = np.where(np.diff(s) != 0)[0] + 1
+        starts = np.r_[0, cuts]
+        ends = np.r_[cuts, len(x) - 1]
+        return np.column_stack((starts, ends)).astype(int)
+
+    def _fit_branches(self, x, y):
+        """Fit a PCHIP model per branch of (x, y)."""
+        x = np.asarray(x)
+        y = y.compute()
+
+        models = []
+        for a, b in self._split_branches(x):
+            xs = x[a:b + 1];
+            ys = y[a:b + 1]
+            idx = np.argsort(xs)
+            xs, ys = xs[idx], ys[idx]
+            xu, inv = np.unique(xs, return_inverse=True)
+            yu = np.bincount(inv, weights=ys) / np.bincount(inv)
+            models.append(PchipInterpolator(xu, yu))
+        return models
+
+    def _interpolate_branchwise(self, x_ref, models):
+        x_ref = np.asarray(x_ref)
+        lim = self._split_branches(x_ref)
+        parts = []
+        for i, (a, b) in enumerate(lim):
+            s = a + (i > 0)  # skip duplicated join point
+            e = b + 1  # inclusive end
+            parts.append(models[i](x_ref[s:e]))
+        return np.concatenate(parts)
+
 
 class Frame:
     '''
@@ -408,100 +565,70 @@ class Frame:
 
         #here we already have
         #self.point_data_indexes - indexes of the curves in the each point
-        #self.x_real, self.y_real - all all real coordinates of the points
+        #self.x_real, self.y_real - all real coordinates of the points
         #self.passes, self.inverse - lists with the numbers of cycles and directions (0 - forward, 1 - backward, 2 - ?undetermined)
 
         # all coordinates of spectral data (real_x, real_y, cycle, direction)
         coordinate = np.array(list(self.calibr_p.values()))[:,:-1].astype('float')
 
         #add points coordinates to the metadata
-        self.metadata['coordinates'] = coordinate
+        #self.metadata['coordinates'] = coordinate
 
-        _arrays = {}
-        _key_dict = {} #to store correspondence between _key and axes
-        #create dictionary with zeros sidpy arrays for each map
-        for aa, _x_key in enumerate(self.calibr_ax):
-            _x_dim = self.calibr_ax[_x_key]
-            _key_dict[_x_key] = {}
-            for mm,_y_key in enumerate(self.calibr_m):
-                _y_dim = self.calibr_m[_y_key]
-                _n = aa * len(self.calibr_m) + mm
-                _key = f'{_n:03}_{_y_dim[0]}({_x_dim[3]})'
-                _key_dict[_x_key][_y_key] = _key
-                _arrays[_key] = np.zeros([len(self.point_data_indexes.keys()),
-                                          len(self.passes),
-                                          len(self.inverse),
-                                          _x_dim[2],])
+        self.arrays = {}
+        for _ppoint in self.point_data_indexes:
+            _ar = {}
+            _units = []
+            _p_coord = np.array(self.calibr_p[_ppoint])[:-1].astype('float')
+            curves = self.point_data_indexes[_ppoint]
+            for curve in curves:
+                _dim = self.calibr_d[curve]
+                _y_data = _point_data[curve]
+                _x_ax = self.calibr_ax[_dim[2]]
+                _x_data = np.linspace(_x_ax[0], _x_ax[1], _x_ax[2]) - _x_ax[3]
+                if _dim[1] % 2 != 0:
+                    _x_data = np.flip(_x_data)
 
-        #fill the arrays
-        for point_number in self.point_data_indexes.keys():
-            for curve_number in self.point_data_indexes[point_number]:
-                _pass      = self.calibr_d[curve_number][0]
-                _direction = self.calibr_d[curve_number][1]
-                _direction = 0 if _direction == 2 else _direction
-                #restore key of array
-                _axis = self.calibr_d[curve_number][2]
-                _meas = self.calibr_d[curve_number][3]
-                _key = _key_dict[_axis][_meas]
-                _arrays[_key][point_number, _pass, _direction] = _point_data[curve_number]
-
-        self.arrays = _arrays
-
-        for _axis in _key_dict:
-            for _meas in _key_dict[_axis]:
-                _key = _key_dict[_axis][_meas]
-                _x_axis, _y_axis = self.calibr_ax[_axis], self.calibr_m[_meas]
-                _x_data = np.linspace(_x_axis[0], _x_axis[1], _x_axis[2])
-                #joint "direction dimension" and squeeze array
-                if len(self.inverse) == 2:
-                    _x_data = np.append(_x_data, np.flip(_x_data))
-                    _arrays[_key] = np.append(_arrays[_key][:, :, 0], _arrays[_key][:, :, 1], axis=2)
-                _arrays[_key] = np.squeeze(_arrays[_key])
-
-                #build sidpy array
-                _data_set = sid.Dataset.from_array(_arrays[_key], name=_key)
-
-                if len(self.point_data_indexes) == 1:
-                    _data_set.data_type = 'spectrum'
+                if _dim[4] in _ar:
+                    comb_data = np.hstack([_ar[_dim[4]][1], _y_data])
+                    x_combined = np.concatenate([_ar[_dim[4]][0], _x_data])
+                    _ar[_dim[4]] = np.array([x_combined, comb_data])
                 else:
-                    _data_set.data_type = 'point_cloud'
+                    _ar[_dim[4]] = np.array([_x_data, _y_data])
+                    _units.append(_dim[5])
 
-                dn = 0 #dimention number
-                # 1) point cloud dimention
-                point_list = list(self.point_data_indexes)
-                if len(point_list) > 1:
-                    _data_set.set_dimension(dn, sid.Dimension(list(self.point_data_indexes),
-                                                              name='point_number',
-                                                              quantity='Point number',
-                                                              dimension_type='point_cloud'))
-                    dn +=1
+            #converting dict with np.arrays into multichannel sidpy spectrum
+            _ar_values = np.array(list(_ar.values()))
+            _ar_channels = list(_ar.keys())
+            _full_y_data = _ar_values[:,1]
+            _full_x_data = _ar_values[0,0]
 
-                if len(self.passes) > 1:
-                    _data_set.set_dimension(dn, sid.Dimension(self.passes,
-                                                              name='pass',
-                                                              quantity='Pass',
-                                                              dimension_type='channel'))
-                    dn += 1
+            _u = _units[0] if len(_units)==1 else 'a.u.'
+            _q = _ar_channels[0] if len(_ar_channels)==1 else 'signal'
 
-                _data_set.set_dimension(dn, sid.Dimension(_x_data,
-                                                          name=_x_axis[-2],
-                                                          units=_x_axis[-1],
-                                                          quantity=_x_axis[-2],
-                                                          dimension_type='spectral'))
-                _data_set.units = _y_axis[1]
-                _data_set.quantity = _y_axis[0]
-                _data_set.metadata = self.metadata
-                _data_set.original_metadata = self.original_metadata
-                _data_set.title = _key
+            _data = sid.Dataset.from_array(_full_y_data.T,
+                                           name='spectrum',
+                                           units=_u,
+                                           quantity=_q,
+                                           datatype = 'spectrum',
+                                           title='Spectrum')
 
-                _arrays[_key] = _data_set
-        if len(_arrays) == 1:
-            self.data = list(_arrays.values())[0]
-            self.data.title = self.title
-        else:
-            self.data = _arrays
-        #self.data.title = self.title
+            _data.set_dimension(0, sid.Dimension(_full_x_data, 'x'))
+            _data.x.dimension_type = 'spectral'
+            _data.x.units = _x_ax[-1]
+            _data.x.quantity = _x_ax[-2]
 
+            _data.set_dimension(1, sid.Dimension(np.arange(_full_y_data.shape[0]), 'channel'))
+            _data.dim_1.dimension_type = 'channel'
+            #_data.metadata = self.metadata
+            #_data.metadata.update({'channels': _ar_channels, 'units': _units, 'coordinate': _p_coord})
+            _data.metadata = {'channels': _ar_channels, 'units': _units, 'coordinate': _p_coord}
+            _data.metadata.update(self.metadata)
+            _data.original_metadata = self.original_metadata #shared for all points
+            if len(self.point_data_indexes) > 1:
+                self.arrays[f'point_{_ppoint}'] = _data#_ar
+            else:
+                self.arrays = _data#_ar
+        self.data = self.arrays
 
         self._file.seek(self.start_pos + self.size)
 
@@ -558,12 +685,13 @@ class Frame:
                 calibr_axis[int(child.attrib['index'])] = (float(child.attrib['start']),
                                                            float(child.attrib['stop']),
                                                            int(child.attrib['count']),
+                                                           float(child.attrib['value']),
                                                            calibr_name[child.attrib['name']][0],
                                                            calibr_name[child.attrib['name']][1])
             if child.tag == 'Point':
                 calibr_points[int(child.attrib['index'])] = (float(child.attrib['x']),
                                                              float(child.attrib['y']),
-                                                             child.attrib['unit'])
+                                                             child.attrib['unit'],)
             if child.tag == 'Meas':
                 calibr_data[int(child.attrib['index'])] = (int(child.attrib['pass']),
                                                             int(child.attrib['inverse0']),
@@ -753,7 +881,6 @@ class Frame:
             hex_list_cor.append(str_part)
 
         return '-'.join(hex_list_cor).upper()
-
 
 
 

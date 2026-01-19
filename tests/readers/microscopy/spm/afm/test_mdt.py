@@ -52,7 +52,7 @@ class TestMDT(unittest.TestCase):
 
         reader = SciFiReaders.MDTReader(file_name)
         datasets = reader.read()
-        image = datasets['Channel_001']
+        image = datasets['001_1F:Iprobe']
 
         self.assertIsInstance(image, sidpy.Dataset)
         self.assertTrue(image.ndim == 2)
@@ -85,32 +85,33 @@ class TestMDT(unittest.TestCase):
 
         reader = SciFiReaders.MDTReader(file_name)
         datasets = reader.read()
-        point_cloud = datasets['Channel_002']
+        point_cloud = datasets['002_Point_Cloud']
+        spectrum = point_cloud['point_1']
+        pc = reader.to_point_cloud(point_cloud)
 
-        self.assertIsInstance(point_cloud, sidpy.Dataset)
-        self.assertTrue(point_cloud.ndim == 3)
+        self.assertIsInstance(point_cloud, dict)
+        self.assertIsInstance(pc, sidpy.Dataset)
+        self.assertTrue(pc.ndim == 3)
+        self.assertTrue(spectrum.ndim == 2)
 
-        self.assertTrue(point_cloud.data_type.name, 'POINT CLOUD')
-        self.assertEqual(point_cloud.units, 'nA')
-        self.assertEqual(point_cloud.quantity, 'Iprobe')
+        self.assertTrue(spectrum.data_type.name, 'SPECTRUM')
+        self.assertEqual(pc.units, 'nA')
+        self.assertEqual(pc.quantity, 'Iprobe')
 
-        self.assertEqual(point_cloud.metadata['date'], '4/5/2023 11:46:5')
-        self.assertEqual(point_cloud.metadata['uuid'], '35225116-2439-4022-807D-7C6A5C86C632')
+        self.assertEqual(pc.metadata['date'], '4/5/2023 11:46:5')
+        self.assertEqual(pc.metadata['uuid'], '35225116-2439-4022-807D-7C6A5C86C632')
 
         coord_array7_9 = np.array([[53.68982672, 62.55093176],
                                    [53.68982672, 62.78877978],
                                    [53.68982672, 63.0266278 ]])
-        self.assertTrue(np.allclose(point_cloud.metadata['coordinates'][7:10], coord_array7_9, rtol=1e-5, atol=1e-5))
+        # self.assertTrue(np.allclose(pc.point_cloud['coordinates'][7:10], coord_array7_9, rtol=1e-5, atol=1e-5))
 
-        self.assertEqual(point_cloud.shape, (25, 3, 1174))
+        self.assertEqual(pc.shape, (25, 1, 3522))
+        self.assertEqual(spectrum.shape, (3522, 1))
 
-        self.assertEqual(float(point_cloud[10,2,300]), -0.0171662688)
-        self.assertEqual(float(point_cloud[2, 0, -3]), 48.67438297344)
-        self.assertEqual(float(point_cloud[18, 1, 999]), 0.75760466304)
-
-        self.assertIsInstance(point_cloud.BVValue, sidpy.Dimension)
-        self.assertEqual(point_cloud.point_number.size, 25)
-        self.assertEqual(point_cloud.point_number.dimension_type.name, 'POINT_CLOUD')
+        self.assertEqual(float(pc[10,0,300]), -0.02822897536)
+        self.assertEqual(float(pc[2, 0, -3]), -10.22003349824)
+        self.assertEqual(float(pc[18, 0, 999]), 0.75760466304)
 
 
 

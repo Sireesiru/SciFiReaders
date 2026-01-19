@@ -1,6 +1,5 @@
 hyperspy
 igor2
 pyNSID
-gwyfile
 pillow
 tifffile
