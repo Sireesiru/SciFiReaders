@@ -18,32 +18,28 @@ root_path = "https://github.com/pycroscopy/SciFiDatasets/blob/main/data/microsco
 
 class TestCZI(unittest.TestCase):
 
-    def test_czi_file(self):
+    @classmethod
+    def setUpClass(cls):
+        """Download test file once for the entire test class."""
         file_path = os.path.join(root_path, 'stains_first_1.1.czi?raw=true')
-        file_name = 'stains_first_1.1.czi'
-        urllib.request.urlretrieve(file_path, file_name)
+        cls.file_name = 'stains_first_1.1.czi'
+        if not os.path.exists(cls.file_name):
+            urllib.request.urlretrieve(file_path, cls.file_name)
 
-        reader = SciFiReaders.CZIReader(file_name)
+    def test_czi_file(self):
+        reader = SciFiReaders.CZIReader(self.file_name)
         datasets = reader.read()
 
         self.assertEqual(type(datasets), list)
         self.assertGreater(len(datasets), 0)
 
     def test_data_available(self):
-        file_path = os.path.join(root_path, 'stains_first_1.1.czi?raw=true')
-        file_name = 'stains_first_1.1.czi'
-        urllib.request.urlretrieve(file_path, file_name)
-
-        reader = SciFiReaders.CZIReader(file_name)
+        reader = SciFiReaders.CZIReader(self.file_name)
 
         self.assertIsInstance(reader, sidpy.Reader)
 
     def test_read_datasets(self):
-        file_path = os.path.join(root_path, 'stains_first_1.1.czi?raw=true')
-        file_name = 'stains_first_1.1.czi'
-        urllib.request.urlretrieve(file_path, file_name)
-
-        reader = SciFiReaders.CZIReader(file_name)
+        reader = SciFiReaders.CZIReader(self.file_name)
         datasets = reader.read()
 
         expected_labels_3d = ['channel_axis (index)', 'y_axis (m)', 'x_axis (m)']
