@@ -48,7 +48,7 @@ hyperspy = ["hyperspy"]
 igor2 = ["igor2"]
 sid = ["pyUSID", "pyNSID"]
 image = ["pillow", "tifffile"]
-test = ["pytest", "hyperspy", "pyUSID", "gdown"]
+test = ["pytest", "hyperspy", "pyUSID", "gdown", "aicspylibczi"]
 
 [project.urls]
 Homepage = "https://pycroscopy.github.io/SciFiReaders/about.html"
