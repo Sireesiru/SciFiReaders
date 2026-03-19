@@ -1,3 +1,6 @@
+"""Part of SciFiReaders, a pycroscopy module
+Author: Sirisha Madugula"""
+
 import numpy as np
 import xml.etree.ElementTree as ET
 from aicspylibczi import CziFile
